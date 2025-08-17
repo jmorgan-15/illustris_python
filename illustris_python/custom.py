@@ -14,6 +14,8 @@ from astropy import constants as c, units as u
 from astropy.cosmology import Planck15 as cosmo, z_at_value
 
 
+
+#This file defines various important functions, including coordinate transforms and subhalo_history, which automates the process of walking through merger trees and interpolates properties that are not present in all snapshots. 
 sim_edge=[0, 75000]
 basepath='./TNG100-1/output/'
 h=0.6774
@@ -45,6 +47,73 @@ special_SF_fields=[]
 special_SF_types, special_SF_times=['SFR_MsunPerYrs_in_r5pkpc_', 'SFR_MsunPerYrs_in_InRad_', 'SFR_MsunPerYrs_in_r30pkpc_', 'SFR_MsunPerYrs_in_all_'], [10,50,100,200,1000]
 special_SF_fields.extend([sftype+f'{x}Myrs' for sftype in special_SF_types for x in  special_SF_times])
 
+def get(path, params=None, my_folder=None):
+#slightly modfied get() function from tutorial so we save cutouts in a special folder organized by snapshot
+  r=requests.get(path, params=params, headers=headers)
+  r.raise_for_status()
+  if r.headers['content-type']=='application/json':
+    return r.json()
+		
+  if 'content-disposition' in r.headers:
+    filename=r.headers['content-disposition'].split('filename=')[1]
+    snapstr=path.split('/')[6] #this happens to be where the snapshot string is located
+    if my_folder==None:
+      full_filename=filename
+    else:
+      full_filename=my_folder+filename
+    with open(full_filename, 'wb') as f:
+      f.write(r.content)
+    return full_filename
+  return r
+  
+  
+def subhalo_history(subid, snapshot=99, last_indexOI=-51):
+  mpb=loadTree('../TNG100-1/output/', snapshot, subid, onlyMPB=True)
+  
+  snapnumlist=np.array(mpb['SnapNum'])[::-1]  #This makes the snapnumbers and list of ids go forward in time. This is necessary for interpolation
+  
+  snapnum_interp=np.linspace(snapnumlist[0], snapnumlist[-1], snapnumlist[-1]-snapnumlist[0]+1)
+  missing_snaps=sorted(set(snapnum_interp)-set(snapnumlist))  #this tells us the snapshots that we have to interpolate over
+  
+  offset_snap=snapnumlist[0]
+  #Not all subhalos formed at same snapshot; to make all trees length 100, pad with np.nans at the beginning of all properties for early snapshots
+  
+  #Some halos are nonexistant during certain snapshots. This shouldn't happen much as it is associated with merging, but in case it does we interpolate values/replace with NaN's
+  snapzid={}  
+  for key, value in mpb.items():
+    if key=='count':
+      continue
+    reverse_val=np.array(value)[::-1]   #this puts all of our properties in the same temporal order as snapnum-- again, necessary for interpolation
+    
+    #It's not appropriate to interpolate things like SubfindID. For these, just want to fill empty spots with np.nan
+    if key in tree_props_no_interpolation:
+      data_holder=[]
+      for i in range(len(snapnum_interp)):
+        snap=snapnum_interp[i]
+        if snap in missing_snaps:
+          data_holder.append(-99999)
+        else:
+          index=np.squeeze(np.where(snapnumlist==snap))[()]
+          data_holder.append(reverse_val[index]) 
+      snapzid[key]=np.int32(data_holder)[:last_indexOI:-1]  #we REFLIP our data temporally because all halos end at snapshot 99, not all begin at same snapshot
+            
+    #interp is 1-D only, so if we have vectors we have to interp each component seperately      
+    elif key in tree_props_multidim:
+      dims=reverse_val.shape[1]
+      data_holder=[]
+      for dim in range(dims):
+        dim_vals=np.interp(snapnum_interp, snapnumlist, reverse_val[:, dim])
+        data_holder.append(dim_vals)
+      snapzid[key]=np.array(data_holder).T[:last_indexOI:-1]  #we REFLIP our data temporally because all halos end at snapshot 99, not all begin at same snapshot
+    
+    #If not multidimensional or non-interpolatable, then just interpolate and save the value  
+    else:
+      snapzid[key]=np.interp(snapnum_interp, snapnumlist, reverse_val)[:last_indexOI:-1]  
+      #we REFLIP our data temporally because all halos end at snapshot 99, not all begin at same snapshot
+  snapzid['SnapNum']=snapnum_interp[:last_indexOI:-1]  #we replace original snapshot numbers with our interpolated ones
+  return snapzid
+  
+  
 def temp_calc(u, x_e):
   X_H=0.76 #"Hydrogen mass function"
   k_B=1.380648e-16 #in CGS (ergs)
@@ -85,7 +154,27 @@ def orientation(primary_info, particle_info, otype):
   
 
 
-
+def general_finder(origin, coords, search_radius):
+#ESSENTIAL TO PASS COORDS AS OPENED ARRAY, NOT DATASET! IE, f['PartType0']['Coordinates'][()], never leave off [()]!
+#This function works by taking particles near the halo but on the other side of the boundary and "moving" them to coords on the other side, basically on-periodic-ing the boundary. ie, shave off left side, add it to right, or shave off right side, add it to left. Really, we are moving the boundary so that this halo no longer crosses it.
+  near_boundary=False 
+  search_origin=copy.deepcopy(origin)
+  for i in range(3):
+    if origin[i]+search_radius>sim_edge[1]:  #if crossing far boundary, create additional, equidistant "fake" origin at near boundary; pretend halo is located at neagtive position  
+      search_origin[i]=-(sim_edge[1]-origin[i])
+      near_boundary=True
+    elif origin[i]-search_radius<sim_edge[0]:  #if crossing near boundary, create additional, equidistant "fake" origin at far boundary; pretend halo is located at positon past 750000
+      search_origin[i]=sim_edge[1]+origin[i]
+      near_boundary=True
+  if near_boundary:
+    mask1=np.sum((coords-origin)**2, axis=1)<(search_radius)**2
+    mask2=np.sum((coords-search_origin)**2, axis=1)<(search_radius)**2
+    radial_mask=mask1 | mask2
+  else:
+    radial_mask=np.sum((coords-origin)**2, axis=1)<(search_radius)**2
+  return radial_mask 
+  
+    
 #types 2, 3 unused, tracers respectively
 particle_types=['gas', 1, 2, 3, 'star', 'bh']
 #particle_types=['gas', 'dm', 'bh']
@@ -142,37 +231,12 @@ def offset_calc(snap, halo_info, all_halos, all_subs, base_path=basepath):
         continue 
       #This line below *ALMOST* works perfectly, but it makes an array for SubhaloGrNr that has a lnegth equal to number of subhalos in halo, ie, for a halo 1492 with 3 subhalos, we end up with 
       #grouping['1492']['SubhaloGrNr']==array([1492, 1492, 1492]). Honestly at this point it is easier to fix this when we make new coordinate systems
-      #I THINK THIS IS FIXED NOW, JUST AN IF STATEMENT WAS NEEDED. IN FACT, KIND OF A GOOD IDEA TO KEEP THE FIELD, "SUBHALOGRNR" THE SAME LENGTH AS NUMBER OF SUBHALOS, SINCE IT IS FUNDAMENTALLY A SUBHALO PROPERTY, EVEN IF JUST REPEATED FOR ALL SUBHALOS. THEN MAKE HALOID WITH LEN=1. BUT I ALREADY HAVE HALOS EXTRACTED WITH LEN(SUBHALOGRNR)==1, SO OH WELL
       if sfield=='SubhaloGrNr':
         grouping[q]['halo_and_sub_properties'][sfield]=haloid
         grouping[q]['halo_and_sub_properties']['HaloID']=haloid
         continue
       grouping[q]['halo_and_sub_properties'][sfield]=np.array([all_subs[sfield][subid] for subid in np.arange(firstsub, lastsub)])
   return grouping
-
-
-def general_finder(origin, coords, search_radius):
-#ESSENTIAL TO PASS COORDS AS OPENED ARRAY, NOT DATASET! IE, f['PartType0']['Coordinates'][()], never leave off [()]!
-#This function works by taking particles near the halo but on the other side of the boundary and "moving" them to coords on the other side, basically on-periodic-ing the boundary. ie, shave off left side, add it to right, or shave off right side, add it to left. Really, we are moving the boundary so that this halo no longer crosses it. I am a genius. 
-  near_boundary=False 
-  search_origin=copy.deepcopy(origin)
-  for i in range(3):
-    if origin[i]+search_radius>sim_edge[1]:  #if crossing far boundary, create additional, equidistant "fake" origin at near boundary; pretend halo is located at neagtive position  
-      search_origin[i]=-(sim_edge[1]-origin[i])
-      near_boundary=True
-    elif origin[i]-search_radius<sim_edge[0]:  #if crossing near boundary, create additional, equidistant "fake" origin at far boundary; pretend halo is located at positon past 750000
-      search_origin[i]=sim_edge[1]+origin[i]
-      near_boundary=True
-  if near_boundary:
-    mask1=np.sum((coords-origin)**2, axis=1)<(search_radius)**2
-    mask2=np.sum((coords-search_origin)**2, axis=1)<(search_radius)**2
-    radial_mask=mask1 | mask2
-  else:
-    radial_mask=np.sum((coords-origin)**2, axis=1)<(search_radius)**2
-  return radial_mask 
-  
-    
-
   
 
 def ray_transform(theta, phi, origin, ray): #ray object should be passed as [ray_start, ray_end]
@@ -201,54 +265,7 @@ def simple_numMergers(mass_array, merger_thresh):
   #Check both ratio and inverse ratio, because we want neither our subhalo of interest nor the subhalo it merges with to be significantly larger or smaller than the other
   return mergers
   
-def subhalo_history(subid, snapshot=99, last_indexOI=-51):
-  #Last_index_OI defines the last snapshots we may want data from. Basically there as easiest way to enforce same size array for all subhalo histories. This makes the data easier to work with later
-  #sub=get(url0+str(snapshot)+'/subhalos/'+str(subid))
-  #mpb_file=get(sub['trees']['sublink_mpb'], my_folder='./merger_trees/')  #retrives file
-  mpb=loadTree('../TNG100-1/output/', snapshot, subid, onlyMPB=True)
-  
-  snapnumlist=np.array(mpb['SnapNum'])[::-1]  #This makes the snapnumbers and list of ids go forward in time. This is necessary for interpolation
-  
-  snapnum_interp=np.linspace(snapnumlist[0], snapnumlist[-1], snapnumlist[-1]-snapnumlist[0]+1)
-  missing_snaps=sorted(set(snapnum_interp)-set(snapnumlist))  #this tells us the snapshots that we have to interpolate over
-  
-  offset_snap=snapnumlist[0]
-  #Not all subhalos formed at same snapshot; to make all trees length 100, pad with np.nans at the beginning of all properties for early snapshots
-  
-  #Some halos are nonexistant during certain snapshots. This shouldn't happen much as it is associated with merging, but in case it does we interpolate values/replace with NaN's
-  snapzid={}  
-  for key, value in mpb.items():
-    if key=='count':
-      continue
-    reverse_val=np.array(value)[::-1]   #this puts all of our properties in the same temporal order as snapnum-- again, necessary for interpolation
-    
-    #It's not appropriate to interpolate things like SubfindID. For these, just want to fill empty spots with np.nan
-    if key in tree_props_no_interpolation:
-      data_holder=[]
-      for i in range(len(snapnum_interp)):
-        snap=snapnum_interp[i]
-        if snap in missing_snaps:
-          data_holder.append(-99999)
-        else:
-          index=np.squeeze(np.where(snapnumlist==snap))[()]
-          data_holder.append(reverse_val[index]) 
-      snapzid[key]=np.int32(data_holder)[:last_indexOI:-1]  #we REFLIP our data temporally because all halos end at snapshot 99, not all begin at same snapshot
-            
-    #interp is 1-D only, so if we have vectors we have to interp each component seperately      
-    elif key in tree_props_multidim:
-      dims=reverse_val.shape[1]
-      data_holder=[]
-      for dim in range(dims):
-        dim_vals=np.interp(snapnum_interp, snapnumlist, reverse_val[:, dim])
-        data_holder.append(dim_vals)
-      snapzid[key]=np.array(data_holder).T[:last_indexOI:-1]  #we REFLIP our data temporally because all halos end at snapshot 99, not all begin at same snapshot
-    
-    #If not multidimensional or non-interpolatable, then just interpolate and save the value  
-    else:
-      snapzid[key]=np.interp(snapnum_interp, snapnumlist, reverse_val)[:last_indexOI:-1]  
-      #we REFLIP our data temporally because all halos end at snapshot 99, not all begin at same snapshot
-  snapzid['SnapNum']=snapnum_interp[:last_indexOI:-1]  #we replace original snapshot numbers with our interpolated ones
-  return snapzid
+
   
 def spherify(comov_pos, comov_vel, scale):
 #due to ratios of distance/velocity, need to use scale factor to accurately find theta, phi. This functions takes as arguments comoving but centered cartesean coordinates/velocities in illustris units. It returns spherical coords centered on same origin as cartesean, in same units as illustris (so center coords and rotate them to fit the orientation of the disk first). We basically have to convert everything to physical units to get angular quanities right, then convert back
